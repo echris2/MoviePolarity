@@ -1,0 +1,709 @@
+---
+title: "Predicting Controversiality of Films"
+author: ""
+date: "5/14/2020"
+output: pdf_document
+fontsize: 11pt
+---
+
+```{r setup, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, cache = FALSE, message = FALSE)
+
+library(caret)
+library(tree)
+library(ROSE)
+library(glmnet)
+library(ROCR)
+library(nnet)
+library(gbm)
+library(e1071)
+
+```
+\ 
+\ 
+
+## Introduction
+
+
+Movie-making is a major industry in the United States, comprising nearly 3.2% of US good and services in 2011,[^EconMovies] with its related culture dominating news cycles and social media topics across the globe. Yet the industry is changing, as digital disruptors pull audiences away from theaters and to subscription streaming services.[^disruptor] With an increasingly crowded industry, with content being produced and released through non-traditional channels, it is becoming increasingly difficult for individual films to stand out from their peers and produce the same impact on society that major cinematic blockbusters traditionally pioneered. For this project I take a look into historical release of films, and search for patterns existing within movie data. 
+
+
+```{r readin}
+
+##NOTE BEFORE RUNNING THIS FILE: The python file RunMe.py must be executed in order to create csv for readin 
+movieDat <- read.csv("Data/TheMovieDatabase_keywords.csv", header = TRUE)
+##contains meta data and keyword cluster binaries
+#str(movieDat)
+
+##group by names
+metaPreds <- names(movieDat)[c(1:24)]
+genrePreds <- names(movieDat)[c(30:49)]
+keyClus <- names(movieDat)[c(50:349)]
+langPreds <- names(movieDat)[c(350:374)]
+productionCos <- names(movieDat[c(25:28)])
+```
+
+\ 
+
+### Data Source
+
+For this project I will be using 'The Movies Dataset', a collection of metadata on 45,000 movies, with 26 million ratings compiled on Kaggle.[^dataset] This database was collected from two primary sources: IMDb and MovieLens. 
+
+IMDb purports to be the "world's most popular and authoritative source for information on movies, TV shows, and celebrities".[^aboutIMDB] Sourced from IMDb, is metadata for films which includes box office revenues, budgets, cast information, and plot summaries - among other features. It includes movies released as far back as 1874 through July 2017. 
+
+MovieLens is a research site designed to create personalized movie recommendations.[^aboutML] From MovieLens, the data set contains ratings ranging from 0.5 to 5 for films from over 270,000 users. Additionally, MovieLens supplied keywords for each film that clue to the content, or story, of each film.
+
+To appropriately work with this data, I constructed a database designed to join the IMDb metadata to the MovieLens ratings using common identification numbers, provided by the Links file on Kaggle.
+
+
+### Prediction Target
+
+There is value in producing films that provoke strong emotional feelings. Strong emotions invoked by a film's contents can drive broad discussions both online, and in the news media - increasing awareness and interest in the film, which can act to ticket sales or online streams. From this dataset, I will examine information related to the contents of a film to see if it may be used to predict this kind of controversiality that can drive virality.
+
+##### Defining the Target
+
+Since there is no tag for controversiality inherent to the database, I constructed an artificial feature relying the ratings information from MovieLens. I believe that the strong feelings would be reflected in the ratings. For purposes of this analysis I define the term "polarized ratings" to be ratings of 0.5 or 1.0 stars (negative polarization) and scores of 4.5 or 5.0 stars (positive polarization). 
+
+I expect controversial films would have a high proportion of both negative and positive polarized ratings. Codifying it into the construction of a Controversial tag, I determined that Controversial movies would have polarized ratings construing at least 30% of all ratings.
+
+To ensure balance between negative and positive polar ratings, I defined and included a Polarity Ratio into my definition of Controversial films. The Polar Ratio, defined as as the number of Positive Polar Ratings divided by the number of Negative Polar Ratings an individual film receives, is allowed to range between 0.4 and 2.5. In other words, one end of the polar rating spectrum cannot exceed the other by more than 2.5 times. This ensures that I am not capturing very popular, or very unpopular movies under my Controversial tag.
+
+Below is one example of the ratings distribution a movie that fit my controversial definition, "The Passion of the Christ" (2004). Its polarized ratings made up 34.5% of all its ratings, and the ratio between positive polar and negative polar ratings was 1.62. 
+
+```{r EDA, fig.height=3, fig.width=5}
+
+movie_meat <- read.csv("Data/movies_metadata_clean.csv", header = TRUE)
+ratings_dat <- read.csv("Data/ratings.csv", header = TRUE)
+links <-read.csv("Data/links.csv", header = TRUE) 
+
+movie_hist <- function(movid){
+  library(dplyr)
+  title <- movie_meat$title[movie_meat$id == movid]
+  year <- movie_meat$release_date[movie_meat$id == movid]
+  link <- filter(links, tmdbId == movid)
+  rats <- filter(ratings_dat, movieId == link$movieId[1])
+  #rats$rating <- ceiling(rats$rating)
+  
+  g <- ggplot(rats, aes(x = rating))
+  
+  gg <- g + geom_bar(stat = "count",fill = "lightblue", color = "black") + theme_minimal() + 
+    labs(title = paste0("\"",title,"\""," Rating Distribution"), x = "Rating", y = "Count") +
+    #geom_vline(aes(xintercept = mean(rating)),col='red',size=2, linetype = 'dashed') +
+    scale_y_continuous(label=scales::comma) + 
+    theme(axis.text.x = element_text(size = 10),
+          axis.text.y = element_text(size = 10),
+          axis.title.x = element_text(face = "bold", size = 12), 
+          axis.title.y = element_text(face = "bold", size = 12),
+          plot.title = element_text(size = 14, face = "bold.italic")
+          )
+  
+  print(gg)
+  
+}
+
+##New Mooon
+#movie_hist(50620)
+##Passion
+movie_hist(615)
+rm(ratings_dat)
+rm(links)
+```
+
+I place several restrictions on the movie dataset while developing a model for predicting controversy. The first restriction is to only consider movies that had at least 30 ratings through the MovieLens movie system. This will ensure my target class is not affected by films that were viewed, and rated, seldomly.
+
+Additionally, I feel it is important to consider the fact that ratings motivated by controversy may be a product of the times. Issues that were considered controversial 40 years ago, may now be commonplace in today’s world. A controversial movie in 1930, may be viewed as rather benign by users rating that movie in 2015. 
+
+In order to accurately capture user opinions on movies, I will only review movies that were released while the MovieLens rating system was online. From the ratings data, I observe the first review was logged on January 9, 1995. It is my determination to only review the controversiality of movies released after December 31, 1994. 
+
+With specifications and restrictions set for for my target variable, I found that 97% of movies in the dataset were considered not controversial, while only 3% of movies fit my specifications to tag as controversial. This problem is one of an imbalanced classification, for which I will make modeling corrections (to be discussed later).
+
+```{r controLayout, include = FALSE, econ = FALSE}
+polar_scores <- c("overview_polarity" ,"tagline_polarity")
+dat <- movieDat[,c("Controversial",genrePreds,keyClus,langPreds, polar_scores,productionCos)]
+
+#remove movies that do not have keyword data
+dat <- na.omit(dat)
+
+
+
+##find keywordClus columns that only have value of 0
+KeyCols <- colSums(dat[,-1])
+KeyCols <- which(KeyCols > 0)
+#drop those columns
+dat <- dat[,c("Controversial",names(KeyCols))]
+
+
+#turn Controversial into factor
+dat$Controversial <- as.factor(dat$Controversial)
+#dat$Rewrite <- as.factor(dat$Rewrite)
+
+#Create 70/30 train test split
+set.seed(123)
+samp <- sample(nrow(dat), nrow(dat)*.7, replace = FALSE)
+
+
+# drops <- c("keyClus_31.0")
+# dat <- dat[,!(names(dat) %in% drops)]
+
+training <- dat[samp,]
+testing <- dat[-samp,]
+
+trOver <- ovun.sample(Controversial ~ ., data = training, method = "over", p = .4)$data
+
+```
+
+```{r chartContr,fig.width=3,fig.height=3}
+g <- ggplot(dat, aes(x = Controversial))
+g + geom_bar(aes(y =  (..count..)/sum(..count..)),stat = "count", fill = "darkblue") + theme_minimal() + 
+  labs(title = "Proportional Population\nof Controversial Films", x = NULL, y = "Proportion") +
+  scale_x_discrete(labels = c("Non-controversial","Controversial")) + 
+  theme(plot.title = element_text(size = 10, face = "bold.italic"))
+```
+
+
+### Feature Selection
+
+In order to predict controversiality of films, I will use 6 main categorical predictors, which will be used to make up over 352 binary predictors for modeling purposes. Below I provide a brief overview of the predictors:
+
+* **Keyword Clusters**
+
+A major source of information with this dataset is the keyword data provided by MovieLens. The keywords are words or short phrases assigned to the film that provide clues as to the content of the movie. For example, the keywords for the film "Finding Nemo", a film about a clownfish searching for his lost son include: 'Father Son Relationship', 'Harbor', 'Clownfish', and 'Protective Father'. Assuming that the controversiality of a movie is driven by the content of the film, it is worth analyzing the keywords data to discover interesting patterns. 
+
+However across the films in this dataset, there existed nearly 20,000 associated unique keywords. To reduce this to a reasonably sized set of predictors, I employed the Word2Vec algorithm. This algorithm converts text into a 300-dimension numeric array. Words with similar meanings are mapped close together in the vector-space.[^word] This allowed me to transform each keyword into a numeric cluster, then run a K-means clustering algorithm to group linguistically-similar keywords. 
+
+This process is exemplified by a word cloud of a random cluster: 
+
+![*Keyword Cluster #143*](Clouds\Clust_143.png) 
+
+After running several tests, using the elbow method and visual inspection to determine the optimal number of clusters, I decided on using 300 keyword clusters. While this did not create perfectly pure clusters, I had to balance the optimal number of clusters with the added complexity the number of predictors would entail. 
+
+Once keyword clusters were assigned, I could then generate one hot encodings for each film, creating a binary columns indicating that a movie was associated with keywords in to a certain cluster. 
+
+* **Genre Classes**
+
+IMDb metadata data included classifications of movies across 21 different genres such as "Action/Adventure" or "Romance". Individual movies could be assigned multiple genres. Genres features were coded with one hot encoding, creating 21 columns of binary data indicating certain genre schemes for individual films
+
+* **Original Language**
+
+IMDb metadata also reported the original language of the film. While most films were English-language, there were many of differing languages. Language could be a proxy for country of production, and perhaps a tell whether a certain country's cinema was more prone to producing more controversial films. I used one hot encoding to create binary columns to indicate a film's language.
+
+* **Sentiment Scores**
+
+IMDb metadata also contained columns with a brief full-sentence summary of the film's plot, referred to as the "Overview". Additionally, the metadata contained a "tagline", or a short slogan used for the film's marketing. To transform this text data into a useful metric, I analyzed these features on the basis of sentiment. To analyze sentiment I used Python's TextBlob module, which processes text and assigns it a score of -1 if the text displays negative emotions, and +1 if the text is identified with positive emotions.
+
+For the film's overview I calculated sentiment scores for each sentence comprising the summary, and then averaged the scores to create an overall sentiment score for the film's overview. For the film's tagline I processed the single sentence with the TextBlob module to create a single score for the film's tagline. 
+
+This information could be useful as it may indicate the tone of a film, where I expect dark, violent, or depressing films to have low scores, while more positive films to have higher scores - again providing clues into the content of each film.
+
+The below histogram shows the distribution of polarity scores of the each film's overview.
+
+```{r Overview Polarity, fig.width=6,fig.height=4}
+### Overview Polarity
+g <- ggplot(movieDat, aes(x = overview_polarity))
+
+g + geom_histogram(fill = "lightgreen", color = "black", bins = 50) + theme_minimal() + 
+  labs(title = "Film Overview Sentiment Score Distribution",                                                                                  x = "Sentiment Score", y = "Count") +  
+  theme(plot.title = element_text(size = 14, face = "bold.italic"), 
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title.x = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 10, face = "bold"))
+
+mu <- mean(movieDat$overview_polarity)
+std <- sd(movieDat$overview_polarity)
+
+
+```
+
+* **Production Companies**
+
+Finally, I analyzed the production companies involved in the making the films. From the IMDb metadata I observed that films had multiple production companies involved in a single film, with over 300 different production companies appearing in the data. 
+
+To transform these feature into a more manageable set of predictors, I examined the number of films each production company was involved in, and then classified those companies into four different sizes: Large, Medium, Small, and Single. 
+
+Single studios are those that were involved with in production of only a single movie in the database, and made up over 90% of the studios. Small studios were those that were involved in the production of 10 films or fewer. Medium studios were involved in the production of 60 films or fewer, and Large studios made up the remaining studios. 
+Removing any films that did not have MovieLens keywords from the dataset, I am left with 7,739 movies and 351 features with which to predict controversiality. This dataset will be split 70/30 into a training and validation set, respectively.
+
+As mentioned earlier, because I am dealing with an unbalance classification problem I also take the step to create an oversampled training set. This training set is created by sampling the current 70% training set, with replacement, until the minority class (Controversial films) comprise at least 40% of the training set. 
+```{r isolate, include = FALSE, echo = FALSE}
+##
+polar_scores <- c("overview_polarity" ,"tagline_polarity")
+dat <- movieDat[,c("Controversial",genrePreds,keyClus,langPreds, polar_scores,productionCos)]
+
+#remove movies that do not have keyword data
+dat <- na.omit(dat)
+
+
+
+##find keywordClus columns that only have value of 0
+KeyCols <- colSums(dat[,-1])
+KeyCols <- which(KeyCols > 0)
+#drop those columns
+dat <- dat[,c("Controversial",names(KeyCols))]
+
+
+#turn Controversial into factor
+dat$Controversial <- as.factor(dat$Controversial)
+#dat$Rewrite <- as.factor(dat$Rewrite)
+
+#Create 70/30 train test split
+set.seed(123)
+samp <- sample(nrow(dat), nrow(dat)*.7, replace = FALSE)
+
+
+# drops <- c("keyClus_31.0")
+# dat <- dat[,!(names(dat) %in% drops)]
+
+training <- dat[samp,]
+testing <- dat[-samp,]
+
+trOver <- ovun.sample(Controversial ~ ., data = training, method = "over", p = .4)$data
+
+```
+\ 
+\ 
+
+## Predictive Models
+
+In targeting film Controversiality, I used three different classification methods: Logistic Regression, Gradient Boosted Random Forest, and a Neural Network classifier.
+
+### Logistic Regression
+
+```{r logModTrain}
+##train logistic models and store predictors 
+tr <- training
+tt <- testing
+#models
+logModel <- glm(Controversial ~ . ,data = tr, family = binomial, maxit = 300)
+logModelOver <- glm(Controversial ~ . ,data = trOver, family = binomial, maxit = 300)
+#predictions
+preds <- predict(logModel, tt[,-1], type = "response")
+predsOver <- predict(logModelOver, tt[,-1], type = "response")
+```
+At the 50% cutoff level on the  training set, the Confusion Matrix for reports an accuracy of 96.17%, with a sensitivity of 0.01 and specificity of 0.99. These scores were expected of an unbalanced classification task. The Confusion Matrix, below, shows that the classifier was stringent - only predicting the minority class in less than 1% of instances. 
+```{r logMod50}
+#confusion matrix at .5 cutoff
+predictions = rep(0, nrow(tt))
+
+cutoff = .5
+
+predictions[preds > cutoff] = 1
+
+confMtx1 <- table(predictions, actual = tt$Controversial)
+confMtx1
+
+accuracy <- round((confMtx1[1] + confMtx1[4]) / sum(confMtx1),4)*100
+
+missClassrate <- 100 - accuracy
+
+sensitivityLog <- round(confMtx1[4]/(confMtx1[3] + confMtx1[4]),4)
+specificityLog <- round(confMtx1[1]/(confMtx1[2] + confMtx1[1]),4)
+
+
+# print(paste0("With a cutoff value of ", cutoff, " the accuracy of the model is ", accuracy,"%, with specificity of ",
+#              specificityLog, " and a sensitivty of ", sensitivityLog))
+
+```
+
+Reducing the threshold probability to 10%, increases the willingness of the classifier to assign to the minority class, increasing sensitivity increases to 0.11, but at the expense of specificity (0.95) and accuracy (92%).
+
+```{r logMod10}
+
+## at .1 cutoff
+cutoff = .1
+predictions = rep(0, nrow(tt))
+predictions[preds > cutoff] = 1
+
+#create conf matrix
+confMtx1 <- table(predictions, actual = tt$Controversial)
+confMtx1
+#accuracy obj
+accuracy <- round((confMtx1[1] + confMtx1[4]) / sum(confMtx1),4)*100
+#missclass obj
+missClassrate <- 100 - accuracy
+#Spec sens objs
+sensitivityLog <- round(confMtx1[4]/(confMtx1[3] + confMtx1[4]),4)
+specificityLog <- round(confMtx1[1]/(confMtx1[2] + confMtx1[1]),4)
+
+
+# print(paste0("With a cutoff value of ", cutoff, " the accuracy of the model is ", accuracy,"%, with specificity of ",
+#              specificityLog, " and a sensitivty of ", sensitivityLog))
+# ##model summary
+# #summary(logModel)
+
+```
+
+To attempt to remedy the issue of the stringent classification model, I use the logistic regression model trained on the oversampled data to redo my predictions. At the 50% cutoff level, the model scored an accuracy of 87% on at a 50% cutoff level, with a corresponding sensitivity of 0.2. 
+
+```{r OlogMod50}
+#confusion matrix at .5 cutoff
+predictions = rep(0, nrow(tt))
+
+cutoff = .5
+
+predictions[predsOver > cutoff] = 1
+
+confMtx1 <- table(predictions, actual = tt$Controversial)
+confMtx1
+
+accuracy <- round((confMtx1[1] + confMtx1[4]) / sum(confMtx1),4)*100
+
+missClassrate <- 100 - accuracy
+
+sensitivityLog <- round(confMtx1[4]/(confMtx1[3] + confMtx1[4]),4)
+specificityLog <- round(confMtx1[1]/(confMtx1[2] + confMtx1[1]),4)
+
+
+# print(paste0("With a cutoff value of ", cutoff, " the accuracy of the model is ", accuracy,"%, with specificity of ",
+#              specificityLog, " and a sensitivty of ", sensitivityLog))
+
+```
+The ROC curve for this logistic model is shown below, with an area under the curve of 0.63.
+```{r AUCOver50, echo = FALSE,fig.width=5,fig.height=5, fig.align="center"}
+
+
+##Oversampled
+#predictions from test data
+preds <- predict(logModelOver, tt[,-1], type = "response")
+
+dat3 <-cbind(tt,preds)
+
+cutoff = .5
+
+#assign class labbels based on cutoff
+dat3$response <- as.factor(ifelse(dat3$preds>cutoff, 1, 0))
+
+#format as prediction object, with probabilities and labels
+logit_scores <- prediction(predictions=dat3$preds, labels=dat3$Controversial)
+logit_perf <- performance(logit_scores, "tpr", "fpr")
+
+#plot ROC curve
+plot(logit_perf,
+     main="ROC Curve: Oversampled Test",
+     xlab="1 - Specificity: False Positive Rate",
+     ylab="Sensitivity: True Positive Rate",
+     col="darkblue",  lwd = 3)
+abline(0,1, lty = 300, col = "darkred",  lwd = 3)
+grid(col="lightgrey")
+
+
+# Calc area under
+logit_auc <- performance(logit_scores, "auc")
+underAUC3 <- as.numeric(logit_auc@y.values)  ##AUC Value
+
+#print(paste0("Area Under the Curve : ", underAUC3))
+```
+\ 
+Translating the model's scores into a lift chart shows the limited value of the model, with its lift declining below 2.0 at very early percentiles.
+. 
+```{r liftLog, fig.width=5, fig.height=5, fig.align="center"}
+##LIFT FOR OVERSAMPLED PERF
+logit_lift <- performance(logit_scores, measure="lift", x.measure="rpp")
+
+plot(logit_lift,
+     main="LogReg-Classed Controversy Lift",
+     xlab="% Populations (Percentile)",
+     ylab="Lift",
+     ylim = c(0,10),
+     col="darkgreen", lwd = 3)
+abline(1,0,col="red",  lwd = 3, lty = "dashed")
+grid(col="lightgrey")
+
+
+```
+
+### Gradient Boosted Machine
+
+With minor success using logistic regression, I try a gradient boosted machine for classification purposes. Based on the improved sensitivity performance observed in the logistic regression, and to avoid the trap of a majority-class-only model, I will be using the oversampled dataset as the model's training set.
+
+I trained and tuned the model using caret's GBM method, across interaction depths ranging from 5 to 15, tree count ranging from 100 to 1000, and shrinkage values of .01 and 0.1. The best model from this training had an interaction depth of 15, and shrink of 0.1, using 1000 trees.
+
+```{r GBM, results = 'hide', include = FALSE}
+##Boosted 
+
+trboost <- trOver
+ttboost <- tt
+
+#convert class to numeric or GBM will crash R
+trboost$Controversial <- as.numeric(as.character(trboost$Controversial))
+ttboost$Controversial <- as.numeric(as.character(tt$Controversial))
+
+#commented out for speed
+# gbmGrid <- expand.grid(.interaction.depth = c(5,10,15), .n.trees =c(100,500,1000), .shrinkage = c(.01,0.1), 
+#                        .n.minobsinnode = 10)
+# Control <- trainControl(method = "cv", number = 10, summaryFunction = twoClassSummary)
+# gbmFit <- train(as.factor(Controversial) ~ ., data = tr, method = "gbm", trControl = Control, tuneGrid = gbmGrid,
+#                 metric = "Spec")
+
+
+#mod run, shrinkage 0.1, depth 15 with five folds
+boostMod <- gbm(Controversial ~., data=trboost, shrinkage=0.1, distribution = 'bernoulli',
+                cv.folds=5,
+                n.trees=1000, verbose= TRUE, interaction.depth = 15)
+
+#optimal trees
+best.iter = gbm.perf(boostMod, method = "cv", plot.it = FALSE)
+preds <- predict(boostMod, newdata=ttboost[,-1], type = "response", n.trees = best.iter)
+```
+The confusion matrix below gives an accuracy of 96.34%, with a sensitivity of 0.08 and specificity of 0.96 at the 10% cutoff level.
+```{r GBMresults}
+
+cutoff = .1
+predictions = rep(0, nrow(ttboost))
+predictions[preds > cutoff] = 1
+
+confMtx1 <- table(predictions, actual = ttboost$Controversial)
+confMtx1
+
+accuracy <- round((confMtx1[1] + confMtx1[4]) / sum(confMtx1),4)*100
+
+missClassrate <- 100 - accuracy
+
+sensitivityLog <- round(confMtx1[4]/(confMtx1[3] + confMtx1[4]),4)
+specificityLog <- round(confMtx1[1]/(confMtx1[2] + confMtx1[1]),4)
+
+
+# print(paste0("With a cutoff value of ", cutoff, " the accuracy of the model is ", accuracy,"%, with specificity of ",
+#              specificityLog, " and a sensitivty of ", sensitivityLog))
+```
+
+At a 10% cutoff level, the ROC curve is shown below, reporting an area under the curve of 0.65 - a slight improvement from the logistic regression.
+
+```{r gbmAUC,fig.width=5,fig.height=5, fig.align="center"}
+##merge predictions and test
+dat3 <-cbind(ttboost,preds)
+#10% cutoff
+cutoff = .1
+#convert preds to class
+dat3$response <- as.factor(ifelse(dat3$preds>cutoff, 1, 0))
+#prediction object
+logit_scores <- prediction(predictions=dat3$preds, labels=dat3$Controversial)
+#performance scores
+logit_perf <- performance(logit_scores, "tpr", "fpr")
+#plot
+plot(logit_perf,
+     main="ROC Curve: Gradient Boosted Model",
+     xlab="1 - Specificity: False Positive Rate",
+     ylab="Sensitivity: True Positive Rate",
+     col="darkblue",  lwd = 3)
+abline(0,1, lty = 300, col = "darkred",  lwd = 3)
+grid(col="lightgrey")
+
+# AREA UNDER THE CURVE
+logit_auc <- performance(logit_scores, "auc")
+underAUC3 <- as.numeric(logit_auc@y.values)  ##AUC Value
+
+#print(paste0("Area Under the Curve : ", underAUC3))
+```
+
+Lift curve for GBM model is shown below, with much of the lift falling before the tenth percentile. However, the lift for this GBM model does appear to be slightly superior to that of the logistic regression.
+
+```{r gbmLift, fig.align="center"}
+#convert to performance onject
+logit_lift <- performance(logit_scores, measure="lift", x.measure="rpp")
+#plit it
+plot(logit_lift,
+     main="GBM-Classed Controversy Lift",
+     xlab="% Populations (Percentile)",
+     ylab="Lift",
+     ylim = c(0,10),
+     col="darkblue", lwd = 3)
+abline(1,0,col="red",  lwd = 3, lty = "dashed")
+grid(col="lightgrey")
+
+##influential features
+# inf <- summary(boostMod)
+# inf <- inf[order(inf$rel.inf, decreasing = TRUE),]
+# head(inf, 10)
+```
+\ 
+I also identified the top influential features in the model:
+
+* Overview Polarity
+* Tagline Polarity
+* Large Studio Involvement
+* Thriller, Horror Genres
+* Keyword Clusters 201 and 45
+
+It could be expected that Thriller and Horror genres are among the most controversial, as these films often try to frighten viewers with shocking or violent scenes - which may be controversial depending on a viewers' appetite for that material. Keyword Cluster #45 is heavily themed with religious keywords. Traditionally, religion has elicited strong emotional reactions of people throughout history (e.g. the Crusades), and it is not unexpected that films dealing with religious topics could provoke the same type of polarizing responses. 
+
+
+### Neural Net
+
+Finally I developed an artificial intelligence solution to assign a flag of Controversiality via the nnet package. This model was developed through ten-fold cross validation, focusing on sensitivity. From the testing I found that the neural network with more hidden layers greatly reduced the number of false positives, with only a minor tradeoff in sensitivity. I eventually tuned the model to reach a neural network with a size of 15, and a decay of 0.01, trained on the oversampled training set. 
+
+```{r neuralnet,echo = FALSE, results = 'hide'}
+
+tr <- trOver
+tt <- testing
+
+set.seed(1144)
+##Removed training for computational speed
+# nnGrid = expand.grid( .decay=c(.01,.001,.1), .size = c(5,10,15))
+# control <- trainControl(method = 'repeatedcv', number = 10, repeats = 3, summaryFunction = twoClassSummary)
+# nnetModel2 = train(x=tr[,-1], y=tr[,1], method="nnet", linout=FALSE, trace=FALSE,
+#                   MaxNWts=70000,
+#                   maxit=200, tuneGrid = nnGrid, trControl = control, metric = "Spec")
+# 
+# 
+# nn <- nnetModel2$finalModel
+
+
+#n3 <- nnet(as.factor(Controversial) ~ ., data = tr, size = 25, MaxNWts = 10000, maxit = 1000, decay = .001)
+
+## Manual Cross validation, removed for code speed
+# library(plyr)
+# 
+# set.seed(1144)
+# cv.acc <- data.frame(size = 0, decay = 0,acc = 0, spec = 0,sens = 0)
+# k <- 10
+# 
+# 
+# 
+# pbar <- create_progress_bar('text')
+# pbar$init(k)
+# for(i in c(15,20,25)){
+#     for (j in c(.001,.01,.1,.2)){
+#     index <- sample(1:nrow(tr),nrow(tr)*.9)
+#     train.cv <- tr[index,]
+#     test.cv <- tr[-index,]
+#     
+#     nn <- nnet(as.factor(Controversial) ~ ., data = train.cv, size = i, decay = j, MaxNWts = 90000, maxit = 200)   
+#     pr_nnet <- predict(nn,tt[,-1], type = "class")
+#     
+#     results <- data.frame(predicted = pr_nnet, actual = tt$Controversial)
+# 
+#     confMtx <- table(results)
+#        
+#     acc <- round((confMtx[1] + confMtx[4]) / sum(confMtx),4)*100
+#     spec <- round(confMtx[1]/(confMtx[2] + confMtx[1]),4)
+#     sensit <- round(confMtx[4]/(confMtx[3] + confMtx[4]),4)
+#     
+#     cv.acc <- rbind(cv.acc,c(i, j,acc, spec,sensit))    
+#      
+#         
+#     }
+#  pbar$step()   
+# }
+
+
+n <- nnet(as.factor(Controversial) ~ ., data = tr, size = 15, MaxNWts = 10000, maxit = 1000, decay = .01)
+```
+The neural network with 15 hidden layers reported an accuracy of 96%, with a sensitivity of just 0.06. The confusion matrix below shows the model was stringent in assigning minority class labels. 
+
+```{r nnResults}
+
+nnetPred = predict(n, newdata=tt[,-1], type = "class")
+
+
+confMtx = table(predictions = nnetPred, acutal = tt[,1])
+confMtx
+
+accuracy <- round((confMtx[1] + confMtx[4]) / sum(confMtx),4)*100
+
+missClassrate <- 100 - accuracy
+
+sensitivityLog <- round(confMtx[4]/(confMtx[3] + confMtx[4]),4)
+specificityLog <- round(confMtx[1]/(confMtx[2] + confMtx[1]),4)
+
+
+# print(paste0("With a cutoff value of ", cutoff, " the accuracy of the model is ", accuracy,"%, with specificity of ",
+#              specificityLog, " and a sensitivty of ", sensitivityLog))
+
+```
+
+The ROC Curve for this model is shown below with an area under the curve of 0.63 - a similar performance to my previous models
+
+```{r nnROC}
+
+#auc
+nnetPred = predict(n, newdata=tt[,-1])
+nn_scores <- prediction(predictions=nnetPred, labels=tt$Controversial)
+
+
+nn_perf <- performance(nn_scores, "tpr", "fpr")
+
+plot(nn_perf,
+     main="ROC Curve: Neural Net",
+     xlab="1 - Specificity: False Positive Rate",
+     ylab="Sensitivity: True Positive Rate",
+     col="darkblue",  lwd = 3)
+abline(0,1, lty = 300, col = "darkred",  lwd = 3)
+grid(col="lightgrey")
+
+# AREA UNDER THE CURVE
+nn_auc <- performance(nn_scores, "auc")
+underAUC3 <- as.numeric(nn_auc@y.values)  ##AUC Value
+
+#print(paste0("Area Under the Curve : ", underAUC3))
+
+
+
+impNN <- varImp(n)
+impNN$pred <- rownames(impNN)
+ordered <- order(impNN$Overall,decreasing = TRUE)
+impNN<- impNN[ordered,]
+#head(impNN,10)
+
+
+```
+For the neural network, the top influential variables were:
+
+* Tagline and Overview Polarity
+* Romance and Comedy genres
+* Single and Small Studio Involvement
+* Keyword Cluster 223 and 241
+
+I note, with interest, that the GBM model determined 'Thriller' and 'Horror' genres to be the most influential, while the neural net determined that 'Romance' and 'Comedy' genres had the greatest influence. These genres may be viewed as almost opposites among the available genres. Further keyword cluster 241, seems to encompass keywords that would appear with horror films, such as "gore", "slasher", and "dystopia".
+
+![*Keyword Cluster #241*](Clouds\Clust_241.png) 
+
+Trying to make sense of tagline and overview polarity as influential features is not straightforward. One possible explanation may be that strongly negative or positive contents of a film are reflected through the overview, and the marketing for the film, and those strong sentiments of the contents are channeled in the audience's reactions to film. However, this is purely conjecture, and more study would be required to determine the actual cause. 
+
+The Lift chart for the neural network is reminiscent of that for the logistic model, with steep declines in early percentiles. 
+
+```{r NNLift}
+#convert to performance onject
+logit_lift <- performance(nn_scores, measure="lift", x.measure="rpp")
+#plit it
+plot(logit_lift,
+     main="Neural Network-Classed Controversy Lift",
+     xlab="% Populations (Percentile)",
+     ylab="Lift",
+     ylim = c(0,10),
+     col="darkblue", lwd = 3)
+abline(1,0,col="red",  lwd = 3, lty = "dashed")
+grid(col="lightgrey")
+```
+
+## Conclusion
+
+While the GBM model performed the best, achieving the highest area under the curve, none of the methods distinguished itself as a means to confidently predict the controversiality of films from its contents. The main issue was low sensitivity, which left the models with limited ability to identify True Positives. 
+
+This result is not necessarily surprising as controversies may often be the result of outside influence, rather than features inherent to the film. Future analyses may be better served by pulling in additional data, such as social media mentions, or counts of relevant news articles at the film's release. 
+
+Another important point to discuss in considering the fallibility of the models, is that the text analysis for keyword clusters and sentiment analysis is only as strong as the natural language processing models. These models are dependent on the linguistic idosyncracies of the base training corpus. For the keyword clustering I used a general Google News text corpus. This meant some film keywords were not able to be vectorized, as there were words in the film keyswords that did not appear the Google corpus. In future analyses, the vectorization may be better served by a corpus that is more aligned with text that would be found in films. 
+
+Finally, I believe that further steps could be taken in this analysis to begin to study the interactions between the various features. For example, more exploratory analysis could be performed to search for similarities among movies are associated with the same keyword clusters. This may inform better features to use to represent a film's contents. 
+
+\ 
+\ 
+\ 
+\ 
+\ 
+
+
+
+[^EconMovies]: Hollywood has blockbuster impact on US economy that tourism fails to match. (2013, December 5). Retrieved May 11, 2020, from https://www.theguardian.com/business/2013/dec/05/arts-culture-us-economy-gdp
+
+[^disruptor]: Hurtz, B. (2017, May 25). Netflix, Hollywood's biggest disruptor, is radically altering the movie landscape. Retrieved May 13, 2020, from https://www.theglobeandmail.com/arts/film/netflix-hollywoods-biggest-disruptor-is-radically-altering-the-movielandscape/article35115001/
+
+[^aboutIMDB]: Press Room. (n.d.). Retrieved from https://www.imdb.com/pressroom/about/
+
+[^aboutML]: About MovieLens. (n.d.). Retrieved May 11, 2020, from https://movielens.org/info/about
+
+[^dataset]: https://www.kaggle.com/rounakbanik/the-movies-dataset 
+
+[^MovieRev]: Fuller, S. (n.d.). Topic: Movie Industry. Retrieved May 11, 2020, from https://www.statista.com/topics/964/film/
+
+[^word]: A Beginner's Guide to Word2Vec and Neural Word Embeddings. (n.d.). Retrieved May 13, 2020, from https://pathmind.com/wiki/word2vec
